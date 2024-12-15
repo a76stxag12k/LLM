@@ -1,8 +1,8 @@
+from langchain.prompts import PromptTemplate
 from langchain_community.chat_models import ChatOllama
 from langchain_community.utilities import DuckDuckGoSearchAPIWrapper
 from langchain_community.tools import DuckDuckGoSearchRun
-from langchain.prompts import PromptTemplate
-from langgraph.graph import END, StateGraph
+from langgraph.graph import StateGraph, END
 from typing_extensions import TypedDict
 from concurrent.futures import ThreadPoolExecutor
 import inspect
@@ -18,12 +18,9 @@ router_prompt = PromptTemplate(
     <|begin_of_text|>
     <|start_header_id|>system<|end_header_id|>
     あなたはユーザーの質問を適切にルーティングする専門家です。
-    Web検索が必要か、それとも直接回答生成が可能かを判断してください。
-    答えが曖昧な場合は、Web検索で正しい結果が必要になります。
-    Web検索が必要な場合は、'Yes'
-    Web検索が不要な場合は、'No' を返して下さい。
-    必ず 'Yes' か 'No' で返して下さい。それ以外は不要です。
-    
+    Web検索が必要か、不要化の判断をして下さい。
+    Web検索が必要な場合を 3 、不要な場合を 0 として
+    必要性を 3 段階の 整数だけで答えて下さい。
     質問: {question}
     <|eot_id|>
     <|start_header_id|>assistant<|end_header_id|>
@@ -36,10 +33,8 @@ query_prompt = PromptTemplate(
     template="""  
     <|begin_of_text|>
     <|start_header_id|>system<|end_header_id|>
-    あなたはリサーチ質問のために最適なWeb検索クエリを作成する専門家です。
-    ユーザーの質問を最も効果的な検索クエリ(検索に使用するワードリスト)に変換し、
-    単語と単語の間は半角空白で区切って下さい。
-    そして、記号ぬきで英語だけの検索クエリを返して下さい。それ以外は不要です。
+    ユーザーの質問を、最適なWeb検索クエリに変換してください。
+    クエリは英語のみを使用し、記号を含まない形式で作成してください。
     
     質問: {question}
     <|eot_id|>
@@ -54,7 +49,7 @@ summary_prompt = PromptTemplate(
     <|begin_of_text|>
     <|start_header_id|>system<|end_header_id|>
     あなたは文章を適切に要約する専門家です。
-    下記の文章を読んで、質問に対し要約した回答を返して下さい。
+    下記の文章を読んで、質問に対し要約し回答して下さい。
     
     質問: {question}
 
@@ -78,12 +73,6 @@ class GraphState(TypedDict):
 def route_question(state: GraphState):
     """
     質問に基づいて、Web検索を行うべきか、LLMを使用して回答を生成するべきかを判断する。
-    
-    Parameters:
-        state (GraphState): 現在の状態を持つ辞書
-    
-    Returns:
-        GraphState: 更新された状態
     """
     # プロンプトに検索ワードを適用
     state['original_question'] = state["question"]
@@ -92,10 +81,12 @@ def route_question(state: GraphState):
     state["question"] = formatted_prompt
 
     # LLM 問い合わせ
-    state = inquireLLM(state)
+    state = inquire_llm(state)
 
-    # LLMの出力が「Yes」であれば、web検索が必要
-    if state["generation"].upper() in "YES":    # 「はい/いいえ」だとキャラクターコードが原因なのか正確に判別できないことがある
+    print('確度:[' + state["generation"] + ']')
+
+    # LLMの出力が 確度:2 より大きい場合、web検索が必要
+    if int(state["generation"]) > 2:
         print('web 検索...')
         state["action"] = "web"         # web検索
     else:
@@ -109,12 +100,6 @@ def route_question(state: GraphState):
 def should_search(state: GraphState):
     """
     Web検索が必要かどうかを決定する。
-    
-    Parameters:
-        state (GraphState): 現在の状態を持つ辞書
-    
-    Returns:
-        str: "web" か "llm" のいずれかを返す
     """
     if "web" == state["action"]:
         return "web"
@@ -125,12 +110,6 @@ def should_search(state: GraphState):
 def transform_query(state: GraphState):
     """
     ユーザーの質問をWeb検索用のクエリに変換する。
-    
-    Parameters:
-        state (GraphState): 現在の状態を持つ辞書
-    
-    Returns:
-        GraphState: 更新された状態
     """
     # LLM に問い合わせるためのプロンプトを作成
     formatted_prompt = query_prompt.format(question=state['question'], )
@@ -141,19 +120,13 @@ def transform_query(state: GraphState):
 def web_search(state: GraphState):
     """
     ユーザーの質問に基づきWeb検索を実行し、その結果をcontextに保存する。
-    
-    Parameters:
-        state (GraphState): 現在の状態を持つ辞書
-    
-    Returns:
-        GraphState: 更新された状態
     """
     # 必要な入力データの取得
     question = state["question"]
     context = state["context"]
 
     # LLM 問い合わせ
-    state = inquireLLM(state)
+    state = inquire_llm(state)
     state["context"] = state["generation"]
 
     user_query = ''
@@ -181,7 +154,7 @@ def web_search(state: GraphState):
     state["question"] = formatted_prompt
 
     # LLM 問い合わせ
-    state = inquireLLM(state)
+    state = inquire_llm(state)
     state["context"] = state["generation"]
 
     return state
@@ -190,32 +163,20 @@ def web_search(state: GraphState):
 def generate(state: GraphState):
     """
     LLM を用いて回答を生成する。
-    
-    Parameters:
-        state (GraphState): 現在の状態を持つ辞書
-    
-    Returns:
-        GraphState: 更新された状態
     """
     # 必要な入力データの取得
     question = state["question"]
     context = state["context"]
 
     # LLM 問い合わせ
-    state = inquireLLM(state)
+    state = inquire_llm(state)
     state["context"] = state["generation"]
     return state
 
 # LLM に問い合わせする関数
-def inquireLLM(state: GraphState):
+def inquire_llm(state: GraphState):
     """
     LLM に質問を投げ、生成された回答を受け取る。
-    
-    Parameters:
-        state (GraphState): 現在の状態を持つ辞書
-    
-    Returns:
-        GraphState: 更新された状態（生成された回答が格納される）
     """
     # 必要な入力データの取得
     question = state["question"]
@@ -274,24 +235,18 @@ def inquireLLM(state: GraphState):
 # ワークフローの定義
 workflow = StateGraph(GraphState)
 
-# ノードを追加
+# ノード追加
 workflow.add_node("route_question", route_question)
 workflow.add_node("generate", generate)
 workflow.add_node("transform_query", transform_query)
 workflow.add_node("web_search", web_search)
 
-# ノード間の遷移を設定
-# route_question → transform_query
-# route_question → generate        という条件付きエッジを作成
+# 条件付きエッジ
 workflow.add_conditional_edges(
-    #開始ノードを指定
     "route_question",
-    #条件が定義されどのノードを呼ぶか判断する関数を指定
     should_search,
     {
-        # 変換(web検索)
         "web": "transform_query",
-        # 生成
         "llm": "generate"
     }
 )
@@ -311,12 +266,6 @@ state = GraphState()
 def run_agent(query):
     """
     与えられたクエリをエージェントで処理し、生成された結果を返す。
-    
-    Parameters:
-        query (str): ユーザーからの入力クエリ
-    
-    Returns:
-        str: 生成された回答
     """
     output = local_agent.invoke({"question": query})
     return output["generation"]
